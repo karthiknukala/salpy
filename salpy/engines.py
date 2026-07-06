@@ -192,33 +192,65 @@ class Engines:
         *,
         context: str | os.PathLike[str] | None = None,
         depth: int = 10,
+        from_depth: int = 0,
+        to_depth: int | None = None,
         solver: str = "yices",
         acyclic: bool = False,
+        iterative: bool = False,
+        induction: bool = False,
+        lemmas: Optional[list[str]] = None,
         timeout: float | None = None,
     ) -> CheckResult:
-        """Run SAL's infinite-state BMC entry points."""
+        """Run SAL's infinite-state BMC entry points.
+
+        Set ``induction=True`` to run SAL's ``sal-inf-bmc/k-induction`` after
+        the bounded safety search succeeds.
+        """
 
         self._load_context(context)
         path_ref, _ = self.session.define("#unspecified")
         assertion_expr = scheme_literal(assertion)
+        to_depth = depth if to_depth is None else to_depth
+        single_step = not iterative
+        lemma_expr = "'()"
+        if lemmas:
+            if not isinstance(assertion, str):
+                raise ValueError("inf-BMC lemmas require a string assertion name.")
+            lemma_list = "(list " + " ".join(scheme_literal(lemma) for lemma in lemmas) + ")"
+            lemma_expr = (
+                f"(sal-inf-bmc/create-assertion-lemmas {lemma_list} "
+                f"(sal/assertion-name {scheme_literal(assertion)}) assertion)"
+            )
         code = f"""
 (begin
-  (let ((assertion (make-flat-assertion {assertion_expr} :ltl? #t)))
+  (let* ((assertion (make-flat-assertion {assertion_expr} :ltl? #t))
+         (lemma-exprs {lemma_expr}))
     (multiple-value-bind
         (valid? ce)
         (cond
           ((sal-module-models/invariant? assertion)
-           (sal-inf-bmc/invariant assertion 0 {depth} {scheme_literal(acyclic)} #t {scheme_literal(sym(solver))}))
+           (sal-inf-bmc/invariant assertion {from_depth} {to_depth} {scheme_literal(acyclic)} {scheme_literal(single_step)} {scheme_literal(sym(solver))}))
           (else
-           (sal-inf-bmc/liveness assertion {depth} #t {scheme_literal(sym(solver))})))
-      (set! {path_ref} (if (eq? ce #unspecified) #unspecified (sal-derived-path->original-path ce)))
-      (print {scheme_literal(BEGIN_TEXT)})
-      (print (cond
-        (valid? "no_counterexample")
-        ((eq? ce #unspecified) "invalid")
-        (else "counterexample")))
-      (print (salpy/class-name {path_ref}))
-      (print {scheme_literal(END_TEXT)})))
+           (sal-inf-bmc/liveness assertion {to_depth} {scheme_literal(single_step)} {scheme_literal(sym(solver))})))
+      (cond
+        ((and valid? {scheme_literal(induction)} (sal-module-models/invariant? assertion))
+         (multiple-value-bind
+             (proved? induction-ce)
+             (sal-inf-bmc/k-induction assertion {to_depth} {scheme_literal(acyclic)} lemma-exprs {scheme_literal(sym(solver))})
+           (set! {path_ref} (if (eq? induction-ce #unspecified) #unspecified (sal-derived-path->original-path induction-ce)))
+           (print {scheme_literal(BEGIN_TEXT)})
+           (print (if proved? "proved" "induction_failed"))
+           (print (salpy/class-name {path_ref}))
+           (print {scheme_literal(END_TEXT)})))
+        (else
+         (set! {path_ref} (if (eq? ce #unspecified) #unspecified (sal-derived-path->original-path ce)))
+         (print {scheme_literal(BEGIN_TEXT)})
+         (print (cond
+           (valid? "no_counterexample")
+           ((eq? ce #unspecified) "invalid")
+           (else "counterexample")))
+         (print (salpy/class-name {path_ref}))
+         (print {scheme_literal(END_TEXT)})))))
   #unspecified)
 """
         return self._result_from_eval(
@@ -227,7 +259,12 @@ class Engines:
             path_ref,
             assertion,
             timeout=timeout,
-            details={"depth": depth, "solver": solver},
+            details={
+                "from_depth": from_depth,
+                "to_depth": to_depth,
+                "solver": solver,
+                "induction": induction,
+            },
         )
 
     def wmc(

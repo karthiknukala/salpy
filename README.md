@@ -98,6 +98,18 @@ need the external solver binaries configured in SAL, such as `yices2-sat`,
 `yices`, `kissat`, or `minisat`; missing solvers are raised as
 `SalEngineError` with SAL's diagnostic output attached.
 
+Infinite-state BMC includes SAL's k-induction entry point:
+
+```python
+result = sal.engines.inf_bmc(
+    "my_context!my_invariant",
+    depth=20,
+    solver="yices",
+    induction=True,
+    lemmas=["my_context!helper_lemma"],
+)
+```
+
 The explicit-state checker in this SAL build handles invariant-style properties
 through `sal-esmc/verify`; SAL reports some liveness explicit-state paths as
 not implemented.

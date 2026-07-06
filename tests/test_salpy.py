@@ -1,6 +1,6 @@
 import unittest
 
-from salpy import SAL, SalNotFoundError, find_sal_dir
+from salpy import SAL, SalEngineError, SalNotFoundError, find_sal_dir
 from salpy.sexpr import scheme_literal, sym
 
 
@@ -44,7 +44,23 @@ class SalIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(result.counterexample)
             self.assertGreaterEqual(result.counterexample.length(), 1)
 
+    def test_inf_bmc_exposes_k_induction(self):
+        with SAL(self.sal_dir, timeout=10) as sal:
+            sal.load_context(self.sal_dir / "examples" / "peterson" / "peterson.sal")
+            try:
+                result = sal.engines.inf_bmc(
+                    "peterson!mutex",
+                    depth=1,
+                    solver="yices",
+                    induction=True,
+                )
+            except SalEngineError as exc:
+                diagnostic = "\n".join([str(exc), exc.stdout, exc.stderr])
+                self.assertIn("Yices", diagnostic)
+            else:
+                self.assertIn(result.status, {"proved", "induction_failed", "no_counterexample"})
+                self.assertTrue(result.details["induction"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
