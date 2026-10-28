@@ -1,16 +1,29 @@
 """Ergonomic Python bindings for the SAL model checker."""
 
 from .builders import ContextBuilder, ModuleBuilder
+from .composition import ModuleExpression, async_, module_expr, sync
 from .core import SAL, connect
 from .engines import CheckResult, Engines, ToolResult
 from .exceptions import (
     SalEngineError,
     SalError,
     SalNotFoundError,
+    SalObjectError,
     SalProcessError,
     SalTimeoutError,
 )
-from .objects import Assertion, BddFsm, Context, Module, Path, SalObject, StateSet, Term, Type
+from .objects import (
+    Assertion,
+    BddFsm,
+    Context,
+    Declaration,
+    Module,
+    Path,
+    SalObject,
+    StateSet,
+    Term,
+    Type,
+)
 from .session import SalSession, find_sal_dir
 from .simulation import Simulation
 
@@ -20,15 +33,18 @@ __all__ = [
     "CheckResult",
     "Context",
     "ContextBuilder",
+    "Declaration",
     "Engines",
     "Module",
     "ModuleBuilder",
+    "ModuleExpression",
     "Path",
     "SAL",
     "SalEngineError",
     "SalError",
     "SalNotFoundError",
     "SalObject",
+    "SalObjectError",
     "SalProcessError",
     "SalSession",
     "SalTimeoutError",
@@ -38,6 +54,8 @@ __all__ = [
     "ToolResult",
     "Type",
     "connect",
+    "async_",
+    "module_expr",
+    "sync",
     "find_sal_dir",
 ]
-

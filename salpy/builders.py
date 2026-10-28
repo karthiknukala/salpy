@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import overload
+
+from .composition import ModuleExpression, ModuleSource, identifier, module_expr
 
 
 def _ensure_semicolon(line: str) -> str:
@@ -47,39 +48,57 @@ class ModuleBuilder:
     commands: list[GuardedCommand] = field(default_factory=list)
     raw_sections: list[str] = field(default_factory=list)
 
-    def input(self, name: str, type_: str) -> "ModuleBuilder":
+    def __post_init__(self) -> None:
+        identifier(self.name)
+
+    def expression(self) -> ModuleExpression:
+        return ModuleExpression(self.name)
+
+    def instantiate(self, *actuals: str | int | bool) -> ModuleExpression:
+        return self.expression().instantiate(*actuals)
+
+    def sync(self, *others: str | ModuleSource) -> ModuleExpression:
+        return self.expression().sync(*others)
+
+    def async_(self, *others: str | ModuleSource) -> ModuleExpression:
+        return self.expression().async_(*others)
+
+    def rename(self, **names: str) -> ModuleExpression:
+        return self.expression().rename(names)
+
+    def input(self, name: str, type_: str) -> ModuleBuilder:
         self.inputs.append((name, type_))
         return self
 
-    def output(self, name: str, type_: str) -> "ModuleBuilder":
+    def output(self, name: str, type_: str) -> ModuleBuilder:
         self.outputs.append((name, type_))
         return self
 
-    def local(self, name: str, type_: str) -> "ModuleBuilder":
+    def local(self, name: str, type_: str) -> ModuleBuilder:
         self.locals.append((name, type_))
         return self
 
-    def global_(self, name: str, type_: str) -> "ModuleBuilder":
+    def global_(self, name: str, type_: str) -> ModuleBuilder:
         self.globals.append((name, type_))
         return self
 
-    def init(self, *lines: str) -> "ModuleBuilder":
+    def init(self, *lines: str) -> ModuleBuilder:
         self.initializations.extend(lines)
         return self
 
-    def definition(self, *lines: str) -> "ModuleBuilder":
+    def definition(self, *lines: str) -> ModuleBuilder:
         self.definitions.extend(lines)
         return self
 
-    def transition(self, *lines: str) -> "ModuleBuilder":
+    def transition(self, *lines: str) -> ModuleBuilder:
         self.transitions.extend(lines)
         return self
 
-    def guarded(self, guard: str, *assignments: str, label: str | None = None) -> "ModuleBuilder":
+    def guarded(self, guard: str, *assignments: str, label: str | None = None) -> ModuleBuilder:
         self.commands.append(GuardedCommand(label, guard, list(assignments)))
         return self
 
-    def raw(self, text: str) -> "ModuleBuilder":
+    def raw(self, text: str) -> ModuleBuilder:
         self.raw_sections.append(text)
         return self
 
@@ -96,10 +115,14 @@ class ModuleBuilder:
                 lines.append(" " * (indent + 4) + f"{title} {var_name} : {type_}")
         if self.initializations:
             lines.append(" " * (indent + 4) + "INITIALIZATION")
-            lines.extend(_indent(line, indent + 6) for line in self.initializations)
+            lines.extend(
+                _indent(line, indent + 6) for line in _definition_lines(self.initializations)
+            )
         if self.definitions:
             lines.append(" " * (indent + 4) + "DEFINITION")
-            lines.extend(_indent(_ensure_semicolon(line), indent + 6) for line in self.definitions)
+            lines.extend(_indent(line, indent + 6) for line in _definition_lines(self.definitions))
+        if self.commands and self.transitions:
+            raise ValueError("Use either guarded commands or transition definitions, not both.")
         if self.commands:
             lines.append(" " * (indent + 4) + "TRANSITION")
             lines.append(" " * (indent + 6) + "[")
@@ -110,11 +133,20 @@ class ModuleBuilder:
             lines.append(" " * (indent + 6) + "]")
         elif self.transitions:
             lines.append(" " * (indent + 4) + "TRANSITION")
-            lines.extend(_indent(line, indent + 6) for line in self.transitions)
+            lines.extend(_indent(line, indent + 6) for line in _definition_lines(self.transitions))
         for section in self.raw_sections:
             lines.append(_indent(section, indent + 4))
         lines.append(" " * (indent + 2) + "END;")
         return "\n".join(lines)
+
+
+@dataclass
+class ModuleDefinition:
+    name: str
+    body: ModuleExpression
+
+    def source(self, *, indent: int = 2) -> str:
+        return _indent(f"{self.name}: MODULE = {self.body};", indent)
 
 
 @dataclass
@@ -124,23 +156,42 @@ class ContextBuilder:
     imports: list[str] = field(default_factory=list)
     types: list[tuple[str, str]] = field(default_factory=list)
     constants: list[str] = field(default_factory=list)
-    modules: list[ModuleBuilder] = field(default_factory=list)
+    modules: list[ModuleBuilder | ModuleDefinition] = field(default_factory=list)
     theorems: list[tuple[str, str, str, str]] = field(default_factory=list)
     raw_declarations: list[str] = field(default_factory=list)
 
-    def import_(self, text: str) -> "ContextBuilder":
+    def __post_init__(self) -> None:
+        identifier(self.name)
+
+    def import_(self, text: str) -> ContextBuilder:
         self.imports.append(text)
         return self
 
-    def type(self, name: str, definition: str) -> "ContextBuilder":
+    def type(self, name: str, definition: str) -> ContextBuilder:
         self.types.append((name, definition))
         return self
 
-    def constant(self, declaration: str) -> "ContextBuilder":
+    def constant(self, declaration: str) -> ContextBuilder:
         self.constants.append(declaration)
         return self
 
-    def module(self, name: str, *, params: str | None = None) -> ModuleBuilder:
+    @overload
+    def module(self, name: str, *, params: str | None = None) -> ModuleBuilder: ...
+
+    @overload
+    def module(self, name: str, expression: str | ModuleSource) -> ModuleExpression: ...
+
+    def module(
+        self, name: str, expression: str | ModuleSource | None = None, *, params: str | None = None
+    ) -> ModuleBuilder | ModuleExpression:
+        identifier(name)
+        if any(module.name == name for module in self.modules):
+            raise ValueError(f"Module {name!r} is already defined.")
+        if expression is not None:
+            if params is not None:
+                raise ValueError("Define parameterized bodies with module(name, params=...).")
+            self.modules.append(ModuleDefinition(name, module_expr(expression)))
+            return ModuleExpression(name)
         module = ModuleBuilder(name=name, params=params)
         self.modules.append(module)
         return module
@@ -148,15 +199,18 @@ class ContextBuilder:
     def theorem(
         self,
         name: str,
-        module: str,
+        module: str | ModuleSource,
         formula: str,
         *,
         kind: str = "THEOREM",
-    ) -> "ContextBuilder":
-        self.theorems.append((name, kind, module, formula))
+    ) -> ContextBuilder:
+        identifier(name)
+        if kind not in {"THEOREM", "LEMMA", "CLAIM", "OBLIGATION"}:
+            raise ValueError(f"Invalid assertion kind: {kind!r}")
+        self.theorems.append((name, kind, str(module_expr(module)), formula))
         return self
 
-    def raw(self, declaration: str) -> "ContextBuilder":
+    def raw(self, declaration: str) -> ContextBuilder:
         self.raw_declarations.append(declaration)
         return self
 
@@ -190,9 +244,16 @@ class ContextBuilder:
         return path
 
     def load(self, sal, directory: str | Path | None = None):
+        if directory is None:
+            return sal.load_source(self.source(), name=self.name)
         return sal.load_context(self.write(directory))
 
     def file_stem(self) -> str:
-        stem = re.split(r"[\s{]", self.name, maxsplit=1)[0]
-        return stem
+        return identifier(self.name)
 
+
+def _definition_lines(lines: list[str]) -> list[str]:
+    """SAL separates definitions with semicolons, not newlines."""
+    return [
+        _ensure_semicolon(line) if idx < len(lines) - 1 else line for idx, line in enumerate(lines)
+    ]

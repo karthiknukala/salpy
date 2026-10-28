@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import bootstrap  # noqa: F401
+from common import sal_example, section, show_lines, show_result, title
 
 from salpy import SAL
-
-from common import sal_example, section, show_lines, show_result, title
 
 
 def main() -> None:

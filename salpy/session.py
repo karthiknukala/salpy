@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
-from typing import Iterable, Optional
 
 from .exceptions import SalNotFoundError, SalProcessError, SalTimeoutError
 from .sexpr import scheme_literal
-
 
 BEGIN_TEXT = "@@@SALPY_BEGIN_TEXT@@@"
 END_TEXT = "@@@SALPY_END_TEXT@@@"
@@ -25,7 +27,7 @@ class EvalResult:
     stderr: str
 
 
-def find_sal_dir(start: Optional[Path] = None) -> Path:
+def find_sal_dir(start: Path | None = None) -> Path:
     """Find a nearby SAL installation directory."""
 
     env_dir = os.environ.get("SALENV_DIR")
@@ -75,19 +77,26 @@ class SalSession:
         context_path: Iterable[str | os.PathLike[str]] | None = None,
         timeout: float = 30.0,
         startup_timeout: float = 30.0,
-        env: Optional[dict[str, str]] = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         self.sal_dir = Path(sal_dir).resolve() if sal_dir else find_sal_dir()
-        self.executable = Path(executable).resolve() if executable else self.sal_dir / "bin" / "salenv"
+        self.executable = (
+            Path(executable).resolve() if executable else self.sal_dir / "bin" / "salenv"
+        )
         if not self.executable.exists():
             raise SalNotFoundError(f"SAL executable not found: {self.executable}")
         self.timeout = timeout
         self.startup_timeout = startup_timeout
-        self.context_path = [str(Path(p)) for p in context_path or []]
+        self._validate_timeout(timeout)
+        self._validate_timeout(startup_timeout)
+        self.context_path = [str(Path(p).resolve()) for p in context_path or []]
         self._env_overrides = dict(env or {})
         self._proc: subprocess.Popen[str] | None = None
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._counter = 0
+        self.generation = 0
+        self._readers: list[threading.Thread] = []
+        self._sources: list[tempfile.TemporaryDirectory] = []
         self._lock = threading.RLock()
         self.start()
 
@@ -95,9 +104,8 @@ class SalSession:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self) -> None:
-        if self.is_running:
-            return
+    def environment(self) -> dict[str, str]:
+        """Build the same configured environment for SALenv and CLI backends."""
         env = os.environ.copy()
         env.update(self._env_overrides)
         env["SALENV_DIR"] = str(self.sal_dir)
@@ -108,6 +116,12 @@ class SalSession:
             if current:
                 pieces.append(current)
             env["SALCONTEXTPATH"] = os.pathsep.join(pieces)
+        return env
+
+    def start(self) -> None:
+        if self.is_running:
+            return
+        self.generation += 1
 
         self._proc = subprocess.Popen(
             [str(self.executable), "--slave-mode"],
@@ -116,24 +130,31 @@ class SalSession:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=env,
+            env=self.environment(),
         )
         self._events = queue.Queue()
         self._start_reader("stdout", self._proc.stdout)
         self._start_reader("stderr", self._proc.stderr)
-        self._wait_for_startup()
-        self._install_helpers()
+        try:
+            self._wait_for_startup()
+            self._install_helpers()
+        except BaseException:
+            self.terminate()
+            raise
 
     def _start_reader(self, source: str, pipe) -> None:
+        events = self._events
+
         def read_loop() -> None:
             try:
                 for line in iter(pipe.readline, ""):
-                    self._events.put((source, line))
+                    events.put((source, line))
             finally:
-                self._events.put((source, ""))
+                events.put((source, ""))
 
         thread = threading.Thread(target=read_loop, name=f"salpy-{source}", daemon=True)
         thread.start()
+        self._readers.append(thread)
 
     def _wait_for_startup(self) -> None:
         deadline = time.monotonic() + self.startup_timeout
@@ -160,37 +181,7 @@ class SalSession:
         raise SalTimeoutError("Timed out waiting for SALenv to start")
 
     def _install_helpers(self) -> None:
-        helpers = r"""
-(begin
-  (define (salpy/pp-string obj)
-    (with-output-to-string (lambda () (sal/pp obj))))
-  (define (salpy/pp-detailed-string obj)
-    (with-output-to-string (lambda () (sal/pp-detailed obj))))
-  (define (salpy/value-pp-string obj)
-    (with-output-to-string (lambda () (sal-value/pp obj))))
-  (define (salpy/class-name obj)
-    (symbol->string (class-name-of (class-of obj))))
-  (define (salpy/string obj)
-    (cond
-      ((string? obj) obj)
-      ((symbol? obj) (symbol->string obj))
-      (else (with-output-to-string (lambda () (display obj))))))
-  (define (salpy/load-context-file! path)
-    (sal-env/import-context-from-file! *sal-env* path)
-    (sal/context (file-name->sal-context-name path)))
-  (define (salpy/import-context! name)
-    (sal-env/import-context! *sal-env* name)
-    (sal/context name))
-  (define (salpy/declaration-names decls)
-    (map (lambda (decl) (symbol->string (sal-decl/name decl))) decls))
-  (define (salpy/context-declaration-names ctx)
-    (salpy/declaration-names (sal-context/declarations ctx)))
-  (define (salpy/module-state-variable-names module)
-    (salpy/declaration-names (sal-module/state-variables module)))
-  (define (salpy/path-length-string path)
-    (salpy/string (sal-path/length path)))
-  #unspecified)
-"""
+        helpers = files("salpy").joinpath("_bridge.scm").read_text(encoding="utf-8")
         self.eval(helpers, timeout=self.startup_timeout)
 
     def _drain_events(self) -> None:
@@ -203,14 +194,29 @@ class SalSession:
     def eval(self, code: str, *, timeout: float | None = None) -> EvalResult:
         """Evaluate one Scheme form and return SAL's printed output."""
 
+        effective_timeout = self.timeout if timeout is None else timeout
+        self._validate_timeout(effective_timeout)
         with self._lock:
             if not self.is_running:
                 raise SalProcessError("SALenv is not running")
             assert self._proc is not None and self._proc.stdin is not None
             self._drain_events()
-            self._proc.stdin.write(code.rstrip() + "\n")
-            self._proc.stdin.flush()
-            return self._collect(timeout or self.timeout)
+            try:
+                self._proc.stdin.write(code.rstrip() + "\n")
+                self._proc.stdin.flush()
+                return self._collect(effective_timeout)
+            except OSError as exc:
+                self.terminate()
+                raise SalProcessError(f"Could not communicate with SALenv: {exc}") from exc
+            except BaseException:
+                # A partially consumed protocol reply must never reach the next call.
+                self.terminate()
+                raise
+
+    @staticmethod
+    def _validate_timeout(value: float) -> None:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Timeout must be a positive, finite number.")
 
     def _collect(self, timeout: float) -> EvalResult:
         deadline = time.monotonic() + timeout
@@ -245,7 +251,9 @@ class SalSession:
                     captured_stderr = "".join(stderr)
                     self.terminate()
                     message = (captured_stderr or captured_stdout).strip()
-                    raise SalProcessError(message, stdout=captured_stdout, stderr=captured_stderr)
+                    raise SalProcessError(
+                        message, stdout=captured_stdout, stderr=captured_stderr
+                    ) from None
                 continue
             if line == "":
                 continue
@@ -258,15 +266,26 @@ class SalSession:
 
             if "*** ERROR:" in line:
                 saw_hard_error = True
-            if "@@@BEGIN_ERROR_MSG@@@" in line:
+            marker = line.rstrip("\r\n")
+            if marker == "@@@BEGIN_ERROR_MSG@@@":
                 in_error = True
                 continue
-            if "@@@END_ERROR_MSG@@@" in line:
+            if marker == "@@@END_ERROR_MSG@@@":
                 message = "".join(error_lines).strip() or "".join(stdout).strip()
                 raise SalProcessError(message, stdout="".join(stdout), stderr="".join(stderr))
-            if "@@@INTERRUPTED@@@" in line:
-                raise SalProcessError("SAL command was interrupted", stdout="".join(stdout), stderr="".join(stderr))
-            if "@@@END_OF_CMD@@@" in line:
+            if marker == "@@@INTERRUPTED@@@":
+                raise SalProcessError(
+                    "SAL command was interrupted", stdout="".join(stdout), stderr="".join(stderr)
+                )
+            if marker == "@@@PP_ERROR@@@":
+                raise SalProcessError(
+                    "SAL could not print the result", stdout="".join(stdout), stderr="".join(stderr)
+                )
+            if marker == "@@@END_OF_CMD@@@":
+                if saw_hard_error or in_error:
+                    raise SalProcessError(
+                        "SAL reported an error", stdout="".join(stdout), stderr="".join(stderr)
+                    )
                 return EvalResult(stdout="".join(stdout), stderr="".join(stderr))
 
             if in_error:
@@ -286,9 +305,13 @@ class SalSession:
                 proc.kill()
                 proc.wait(timeout=2)
         self._close_proc_streams(proc)
+        self._join_readers()
         self._proc = None
 
     def close(self) -> None:
+        for source in self._sources:
+            source.cleanup()
+        self._sources.clear()
         proc = self._proc
         if proc is None:
             return
@@ -297,11 +320,45 @@ class SalSession:
                 proc.stdin.write("(exit)\n")
                 proc.stdin.flush()
                 proc.wait(timeout=3)
-            except Exception:
+            except (OSError, subprocess.TimeoutExpired):
                 self.terminate()
                 return
         self._close_proc_streams(proc)
+        self._join_readers()
         self._proc = None
+
+    def _join_readers(self) -> None:
+        for reader in self._readers:
+            reader.join(timeout=2)
+        self._readers.clear()
+
+    def write_source(
+        self,
+        source: str,
+        name: str,
+        directory: str | os.PathLike[str] | None = None,
+        *,
+        suffix: str = ".sal",
+    ) -> Path:
+        from .composition import identifier
+
+        identifier(name)
+        if suffix not in {".sal", ".lsal"}:
+            raise ValueError("Source files must use .sal or .lsal syntax.")
+        if directory is None:
+            temporary = tempfile.TemporaryDirectory(prefix="salpy-")
+            self._sources.append(temporary)
+            directory = temporary.name
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        target = path / f"{name}{suffix}"
+        target.write_text(source, encoding="utf-8")
+        return target
+
+    def unique_name(self, prefix: str = "__salpy") -> str:
+        with self._lock:
+            self._counter += 1
+            return f"{prefix}_{self._counter}"
 
     @staticmethod
     def _close_proc_streams(proc: subprocess.Popen[str]) -> None:
@@ -312,7 +369,7 @@ class SalSession:
                 except OSError:
                     pass
 
-    def __enter__(self) -> "SalSession":
+    def __enter__(self) -> SalSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -342,8 +399,7 @@ class SalSession:
         return [line for line in extract_text_block(text).splitlines()]
 
     def define(self, expr: str, *, timeout: float | None = None) -> tuple[str, str]:
-        self._counter += 1
-        name = f"__salpy_{self._counter}"
+        name = self.unique_name()
         code = f"""
 (begin
   (define {name} {expr})
@@ -369,13 +425,12 @@ class SalSession:
 
 
 def extract_text_block(output: str) -> str:
-    start = output.find(BEGIN_TEXT)
-    end = output.find(END_TEXT)
-    if start < 0 or end < 0 or end < start:
-        raise SalProcessError("SAL response did not contain a salpy text block", stdout=output)
-    text = output[start + len(BEGIN_TEXT) : end]
-    if text.startswith("\n"):
-        text = text[1:]
-    if text.endswith("\n"):
-        text = text[:-1]
-    return text
+    lines = output.splitlines(keepends=True)
+    for start, line in enumerate(lines):
+        if line.rstrip("\r\n") != BEGIN_TEXT:
+            continue
+        for end in range(start + 1, len(lines)):
+            if lines[end].rstrip("\r\n") == END_TEXT:
+                text = "".join(lines[start + 1 : end])
+                return text.removesuffix("\n").removesuffix("\r")
+    raise SalProcessError("SAL response did not contain a salpy text block", stdout=output)

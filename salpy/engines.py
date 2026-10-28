@@ -6,10 +6,9 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from .exceptions import SalEngineError, SalProcessError
-from .objects import Path as SalPath
+from .exceptions import SalEngineError, SalProcessError, SalTimeoutError
 from .objects import SalObject, wrap_object
 from .session import BEGIN_TEXT, END_TEXT, SalSession, extract_text_block
 from .sexpr import scheme_literal, sym
@@ -21,8 +20,10 @@ class CheckResult:
     status: str
     counterexample: SalObject | None = None
     witness: SalObject | None = None
+    induction_counterexample: SalObject | None = None
     assertion: Any = None
     output: str = ""
+    stderr: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -31,7 +32,19 @@ class CheckResult:
 
     @property
     def has_trace(self) -> bool:
-        return self.counterexample is not None or self.witness is not None
+        return any(
+            item is not None
+            for item in (self.counterexample, self.witness, self.induction_counterexample)
+        )
+
+    @property
+    def proved(self) -> bool:
+        """True only for a proof, never for a bounded absence of counterexamples."""
+        return self.status in {"proved", "valid"}
+
+    @property
+    def bounded_safe(self) -> bool:
+        return self.status == "no_counterexample"
 
     def __bool__(self) -> bool:
         return self.ok
@@ -49,7 +62,7 @@ class ToolResult:
     def ok(self) -> bool:
         return self.returncode == 0
 
-    def check(self) -> "ToolResult":
+    def check(self) -> ToolResult:
         if not self.ok:
             raise SalEngineError(
                 f"{self.tool} exited with code {self.returncode}",
@@ -65,7 +78,7 @@ class Engines:
 
     @property
     def session(self) -> SalSession:
-        return self.sal.session
+        return self.sal if isinstance(self.sal, SalSession) else self.sal.session
 
     def smc(
         self,
@@ -83,7 +96,7 @@ class Engines:
 
         self._load_context(context)
         path_ref, _ = self.session.define("#unspecified")
-        assertion_expr = scheme_literal(assertion)
+        assertion_expr = scheme_literal(assertion, session=self.session)
         code = f"""
 (begin
   (sal-smc/enable-counter-examples! {scheme_literal(counterexamples)})
@@ -126,64 +139,24 @@ class Engines:
         acyclic: bool = False,
         iterative: bool = False,
         induction: bool = False,
-        lemmas: Optional[list[str]] = None,
+        lemmas: list[str] | None = None,
         timeout: float | None = None,
     ) -> CheckResult:
         """Run SAL's bounded model checker."""
 
-        self._load_context(context)
-        path_ref, _ = self.session.define("#unspecified")
-        assertion_expr = scheme_literal(assertion)
-        to_depth = depth if to_depth is None else to_depth
-        single_step = not iterative
-        lemma_expr = "'()"
-        if lemmas:
-            if not isinstance(assertion, str):
-                raise ValueError("BMC lemmas require a string assertion name.")
-            lemma_list = "(list " + " ".join(scheme_literal(lemma) for lemma in lemmas) + ")"
-            lemma_expr = (
-                f"(sal-bmc/create-assertion-lemmas {lemma_list} "
-                f"(sal/assertion-name {scheme_literal(assertion)}) assertion)"
-            )
-        code = f"""
-(begin
-  (let* ((assertion (make-boolean-assertion {assertion_expr} :ltl? #t))
-         (lemma-exprs {lemma_expr}))
-    (multiple-value-bind
-        (valid? ce)
-        (cond
-          ((sal-module-models/invariant? assertion)
-           (sal-bmc/invariant assertion {from_depth} {to_depth} {scheme_literal(acyclic)} {scheme_literal(single_step)} {scheme_literal(sym(solver))}))
-          (else
-           (sal-bmc/liveness assertion {to_depth} {scheme_literal(single_step)} {scheme_literal(sym(solver))})))
-      (cond
-        ((and valid? {scheme_literal(induction)} (sal-module-models/invariant? assertion))
-         (multiple-value-bind
-             (proved? induction-ce)
-             (sal-bmc/k-induction assertion {to_depth} {scheme_literal(acyclic)} lemma-exprs {scheme_literal(sym(solver))})
-           (set! {path_ref} (if (eq? induction-ce #unspecified) #unspecified (sal-derived-path->original-path induction-ce)))
-           (print {scheme_literal(BEGIN_TEXT)})
-           (print (if proved? "proved" "induction_failed"))
-           (print (salpy/class-name {path_ref}))
-           (print {scheme_literal(END_TEXT)})))
-        (else
-         (set! {path_ref} (if (eq? ce #unspecified) #unspecified (sal-derived-path->original-path ce)))
-         (print {scheme_literal(BEGIN_TEXT)})
-         (print (cond
-           (valid? "no_counterexample")
-           ((eq? ce #unspecified) "invalid")
-           (else "counterexample")))
-         (print (salpy/class-name {path_ref}))
-         (print {scheme_literal(END_TEXT)})))))
-  #unspecified)
-"""
-        return self._result_from_eval(
+        return self._bounded(
             "bmc",
-            code,
-            path_ref,
             assertion,
+            context=context,
+            depth=depth,
+            from_depth=from_depth,
+            to_depth=to_depth,
+            solver=solver,
+            acyclic=acyclic,
+            iterative=iterative,
+            induction=induction,
+            lemmas=lemmas,
             timeout=timeout,
-            details={"from_depth": from_depth, "to_depth": to_depth, "solver": solver},
         )
 
     def inf_bmc(
@@ -198,7 +171,7 @@ class Engines:
         acyclic: bool = False,
         iterative: bool = False,
         induction: bool = False,
-        lemmas: Optional[list[str]] = None,
+        lemmas: list[str] | None = None,
         timeout: float | None = None,
     ) -> CheckResult:
         """Run SAL's infinite-state BMC entry points.
@@ -207,36 +180,105 @@ class Engines:
         the bounded safety search succeeds.
         """
 
+        return self._bounded(
+            "inf_bmc",
+            assertion,
+            context=context,
+            depth=depth,
+            from_depth=from_depth,
+            to_depth=to_depth,
+            solver=solver,
+            acyclic=acyclic,
+            iterative=iterative,
+            induction=induction,
+            lemmas=lemmas,
+            timeout=timeout,
+        )
+
+    def _bounded(
+        self,
+        engine: str,
+        assertion: str | SalObject,
+        *,
+        context,
+        depth: int,
+        from_depth: int,
+        to_depth: int | None,
+        solver: str,
+        acyclic: bool,
+        iterative: bool,
+        induction: bool,
+        lemmas: list[str] | None,
+        timeout: float | None,
+    ) -> CheckResult:
+        upper = depth if to_depth is None else to_depth
+        if (
+            any(
+                isinstance(n, bool) or not isinstance(n, int) or n < 0
+                for n in (depth, from_depth, upper)
+            )
+            or from_depth > upper
+        ):
+            raise ValueError("BMC requires integer depths with 0 <= from_depth <= to_depth.")
+        if induction and (from_depth != 0 or upper == 0):
+            raise ValueError("K-induction requires from_depth=0 and a positive depth.")
+        if lemmas and not induction:
+            raise ValueError("Lemmas require induction=True.")
+        if lemmas and (not isinstance(assertion, str) or isinstance(lemmas, str)):
+            raise ValueError("Lemmas require a named assertion and a list of assertion names.")
+        if lemmas and any(not isinstance(lemma, str) for lemma in lemmas):
+            raise TypeError("Lemma names must be strings.")
+        solver_expr = scheme_literal(sym(solver))
+        assertion_expr = scheme_literal(assertion, session=self.session)
         self._load_context(context)
-        path_ref, _ = self.session.define("#unspecified")
-        assertion_expr = scheme_literal(assertion)
-        to_depth = depth if to_depth is None else to_depth
+        prefix = "sal-inf-bmc" if engine == "inf_bmc" else "sal-bmc"
+        make_assertion = "make-flat-assertion" if engine == "inf_bmc" else "make-boolean-assertion"
+        try:
+            assertion_ref, _ = self.session.define(
+                f"({make_assertion} {assertion_expr} :ltl? #t)", timeout=timeout
+            )
+            if induction:
+                invariant = (
+                    self.session.capture_text(
+                        f'(if (sal-module-models/invariant? {assertion_ref}) "true" "false")',
+                        timeout=timeout,
+                    ).strip()
+                    == "true"
+                )
+                if not invariant:
+                    raise ValueError(
+                        "K-induction is only supported for invariant (safety) properties."
+                    )
+            path_ref, _ = self.session.define("#unspecified", timeout=timeout)
+        except SalTimeoutError:
+            raise
+        except SalProcessError as exc:
+            raise SalEngineError(
+                f"{engine} failed: {exc}", stdout=exc.stdout, stderr=exc.stderr
+            ) from exc
         single_step = not iterative
         lemma_expr = "'()"
         if lemmas:
-            if not isinstance(assertion, str):
-                raise ValueError("inf-BMC lemmas require a string assertion name.")
-            lemma_list = "(list " + " ".join(scheme_literal(lemma) for lemma in lemmas) + ")"
             lemma_expr = (
-                f"(sal-inf-bmc/create-assertion-lemmas {lemma_list} "
+                f"({prefix}/create-assertion-lemmas {scheme_literal(lemmas)} "
                 f"(sal/assertion-name {scheme_literal(assertion)}) assertion)"
             )
         code = f"""
 (begin
-  (let* ((assertion (make-flat-assertion {assertion_expr} :ltl? #t))
+  (let* ((assertion {assertion_ref})
          (lemma-exprs {lemma_expr}))
     (multiple-value-bind
         (valid? ce)
         (cond
           ((sal-module-models/invariant? assertion)
-           (sal-inf-bmc/invariant assertion {from_depth} {to_depth} {scheme_literal(acyclic)} {scheme_literal(single_step)} {scheme_literal(sym(solver))}))
+           ({prefix}/invariant assertion {from_depth} {upper} {scheme_literal(acyclic)} {scheme_literal(single_step)} {solver_expr}))
           (else
-           (sal-inf-bmc/liveness assertion {to_depth} {scheme_literal(single_step)} {scheme_literal(sym(solver))})))
+           ({prefix}/liveness assertion {upper} {scheme_literal(single_step)} {solver_expr})))
       (cond
         ((and valid? {scheme_literal(induction)} (sal-module-models/invariant? assertion))
          (multiple-value-bind
              (proved? induction-ce)
-             (sal-inf-bmc/k-induction assertion {to_depth} {scheme_literal(acyclic)} lemma-exprs {scheme_literal(sym(solver))})
+             ({prefix}/k-induction assertion {upper} {scheme_literal(acyclic)} lemma-exprs {solver_expr})
            (set! {path_ref} (if (eq? induction-ce #unspecified) #unspecified (sal-derived-path->original-path induction-ce)))
            (print {scheme_literal(BEGIN_TEXT)})
            (print (if proved? "proved" "induction_failed"))
@@ -254,16 +296,18 @@ class Engines:
   #unspecified)
 """
         return self._result_from_eval(
-            "inf_bmc",
+            engine,
             code,
             path_ref,
             assertion,
             timeout=timeout,
             details={
                 "from_depth": from_depth,
-                "to_depth": to_depth,
+                "to_depth": upper,
                 "solver": solver,
                 "induction": induction,
+                "iterative": iterative,
+                "acyclic": acyclic,
             },
         )
 
@@ -278,7 +322,7 @@ class Engines:
 
         self._load_context(context)
         evidence_ref, _ = self.session.define("#unspecified")
-        assertion_expr = scheme_literal(assertion)
+        assertion_expr = scheme_literal(assertion, session=self.session)
         code = f"""
 (begin
   (let* ((assertion0 (make-boolean-assertion {assertion_expr}))
@@ -316,7 +360,7 @@ class Engines:
 
         self._load_context(context)
         path_ref, _ = self.session.define("#unspecified")
-        assertion_expr = scheme_literal(assertion)
+        assertion_expr = scheme_literal(assertion, session=self.session)
         depth_expr = "#f" if max_depth is None else str(max_depth)
         code = f"""
 (begin
@@ -353,23 +397,31 @@ class Engines:
             details={"strategy": strategy, "max_depth": max_depth},
         )
 
-    def command(self, tool: str, *args: str | os.PathLike[str], timeout: float | None = None) -> ToolResult:
+    def command(
+        self, tool: str, *args: str | os.PathLike[str], timeout: float | None = None
+    ) -> ToolResult:
         """Run one of SAL's command-line tools and return captured output."""
 
         tool_path = Path(tool)
         if not tool_path.is_absolute():
             tool_path = self.session.sal_dir / "bin" / tool
-        env = os.environ.copy()
-        env["SALENV_DIR"] = str(self.session.sal_dir)
-        env["PATH"] = env.get("PATH", "") + os.pathsep + str(self.session.sal_dir / "bin")
-        completed = subprocess.run(
-            [str(tool_path), *(str(arg) for arg in args)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                [str(tool_path), *(str(arg) for arg in args)],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+                env=self.session.environment(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SalTimeoutError(
+                f"{tool} timed out after {exc.timeout:g} seconds",
+                stdout=_output_text(exc.stdout),
+                stderr=_output_text(exc.stderr),
+            ) from exc
+        except OSError as exc:
+            raise SalEngineError(f"Could not run {tool_path}: {exc}") from exc
         return ToolResult(
             tool=str(tool_path),
             args=tuple(str(arg) for arg in args),
@@ -380,6 +432,8 @@ class Engines:
 
     def _load_context(self, context: str | os.PathLike[str] | None) -> None:
         if context is not None:
+            if isinstance(self.sal, SalSession):
+                raise ValueError("Load contexts through SAL.load_context() before Module.check().")
             self.sal.load_context(context)
 
     def _result_from_eval(
@@ -390,12 +444,16 @@ class Engines:
         assertion: Any,
         *,
         timeout: float | None = None,
-        details: Optional[dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
     ) -> CheckResult:
         try:
             eval_result = self.session.eval(code, timeout=timeout)
+        except SalTimeoutError:
+            raise
         except SalProcessError as exc:
-            raise SalEngineError(f"{engine} failed: {exc}", stdout=exc.stdout, stderr=exc.stderr) from exc
+            raise SalEngineError(
+                f"{engine} failed: {exc}", stdout=exc.stdout, stderr=exc.stderr
+            ) from exc
 
         block = extract_text_block(eval_result.stdout).splitlines()
         status = block[0].strip() if block else "unknown"
@@ -403,13 +461,23 @@ class Engines:
         trace = None
         if class_name and class_name != "<primitive>" and engine == "wmc":
             trace = wrap_object(self.session, object_ref, class_name)
-        elif class_name and class_name != "<primitive>" and status not in {"proved", "valid", "no_counterexample", "unknown"}:
+        elif (
+            class_name
+            and class_name != "<primitive>"
+            and status not in {"proved", "valid", "no_counterexample", "unknown"}
+        ):
             trace = wrap_object(self.session, object_ref, class_name, kind="path")
         return CheckResult(
             engine=engine,
             status=status,
-            counterexample=trace,
+            counterexample=trace if status != "induction_failed" else None,
+            induction_counterexample=trace if status == "induction_failed" else None,
             assertion=assertion,
             output=eval_result.stdout,
+            stderr=eval_result.stderr,
             details=dict(details or {}),
         )
+
+
+def _output_text(value: str | bytes | None) -> str:
+    return value.decode(errors="replace") if isinstance(value, bytes) else value or ""

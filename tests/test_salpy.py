@@ -1,66 +1,71 @@
-import unittest
+from __future__ import annotations
 
-from salpy import SAL, SalEngineError, SalNotFoundError, find_sal_dir
-from salpy.sexpr import scheme_literal, sym
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 
-class SchemeLiteralTests(unittest.TestCase):
-    def test_quotes_symbols_as_data(self):
-        self.assertEqual(scheme_literal(sym("yices2")), "'yices2")
-        self.assertEqual(scheme_literal(sym(":ltl?")), ":ltl?")
-
-
-class SalIntegrationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        try:
-            cls.sal_dir = find_sal_dir()
-        except SalNotFoundError as exc:
-            raise unittest.SkipTest(str(exc)) from exc
-
-    def test_terms_are_parsed_and_typechecked(self):
-        with SAL(self.sal_dir, timeout=20) as sal:
-            expr = sal.expr("1 + 2")
-            self.assertEqual(expr.pp().strip(), "1 + 2")
-            self.assertEqual(expr.type().pp().strip(), "nat")
-
-    def test_builder_model_checks(self):
-        with SAL(self.sal_dir, timeout=20) as sal:
-            ctx = sal.builder("toggle_test")
-            ctx.module("main").output("x", "BOOLEAN").init("x = FALSE").transition("x' = NOT x")
-            ctx.theorem("safe", "main", "G(x = TRUE OR x = FALSE)")
-            ctx.load(sal)
-            result = sal.engines.smc("toggle_test!safe")
-            self.assertEqual(result.status, "proved")
-            self.assertTrue(result.ok)
-
-    def test_smc_counterexample_path(self):
-        with SAL(self.sal_dir, timeout=30) as sal:
-            result = sal.engines.smc(
-                "peterson!invalid",
-                context=self.sal_dir / "examples" / "peterson" / "peterson.sal",
-            )
-            self.assertEqual(result.status, "counterexample")
-            self.assertIsNotNone(result.counterexample)
-            self.assertGreaterEqual(result.counterexample.length(), 1)
-
-    def test_inf_bmc_exposes_k_induction(self):
-        with SAL(self.sal_dir, timeout=10) as sal:
-            sal.load_context(self.sal_dir / "examples" / "peterson" / "peterson.sal")
-            try:
-                result = sal.engines.inf_bmc(
-                    "peterson!mutex",
-                    depth=1,
-                    solver="yices",
-                    induction=True,
-                )
-            except SalEngineError as exc:
-                diagnostic = "\n".join([str(exc), exc.stdout, exc.stderr])
-                self.assertIn("Yices", diagnostic)
-            else:
-                self.assertIn(result.status, {"proved", "induction_failed", "no_counterexample"})
-                self.assertTrue(result.details["induction"])
+from salpy import SalObject, SalObjectError
+from salpy.objects import _sal_number_to_int
+from salpy.sexpr import keyword, scheme_call, scheme_literal, sym
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, "#t"),
+        (False, "#f"),
+        (None, "#f"),
+        (42, "42"),
+        (1.5, "1.5"),
+        ('a"b\n', '"a\\"b\\n"'),
+        ([1, True], "(list 1 #t)"),
+        (sym("yices2"), "'yices2"),
+        (keyword("ltl?"), ":ltl?"),
+    ],
+)
+def test_scheme_literals(value, expected):
+    assert scheme_literal(value) == expected
+
+
+@pytest.mark.parametrize("value", ["two words", "x)(exit", "", "'quoted"])
+def test_symbols_cannot_inject_forms(value):
+    with pytest.raises(ValueError):
+        sym(value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_scheme_numbers_are_rejected(value):
+    with pytest.raises(ValueError):
+        scheme_literal(value)
+
+
+def test_unsupported_literals_are_rejected():
+    with pytest.raises(TypeError):
+        scheme_literal({"x": 1})
+
+
+def test_function_calls_validate_names():
+    assert scheme_call("some/function", True, "text") == '(some/function #t "text")'
+    with pytest.raises(ValueError):
+        scheme_call("foo) (exit")
+
+
+def test_state_counts_preserve_large_integer_precision():
+    assert _sal_number_to_int("9007199254740993.0") == 9007199254740993
+    assert _sal_number_to_int("89.0") == 89
+    with pytest.raises(ValueError):
+        _sal_number_to_int("1.5")
+
+
+def test_cross_session_and_stale_object_references_are_rejected():
+    session = SimpleNamespace(generation=1, is_running=True, eval=Mock(), capture_text=Mock())
+    obj = SalObject(session, "ref")
+    assert scheme_literal(obj, session=session) == "ref"
+    with pytest.raises(SalObjectError, match="different sessions"):
+        scheme_literal([obj], session=SimpleNamespace())
+    session.generation += 1
+    with pytest.raises(SalObjectError, match="reset"):
+        obj.pp()
+    session.eval.assert_not_called()
+    session.capture_text.assert_not_called()

@@ -9,6 +9,10 @@ class SalNotFoundError(SalError):
     """Raised when a SAL installation or executable cannot be found."""
 
 
+class SalObjectError(SalError):
+    """Raised for released, stale, or cross-session SAL object references."""
+
+
 class SalProcessError(SalError):
     """Raised when SAL reports an evaluation or process error."""
 
@@ -24,4 +28,3 @@ class SalTimeoutError(SalProcessError):
 
 class SalEngineError(SalProcessError):
     """Raised when a model-checking backend fails."""
-

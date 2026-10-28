@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "salpy"
 version = "0.1.0"
 description = "Ergonomic Python bindings for the SAL model checker"
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
+requires-python = ">=3.10"
+license = "MIT"
 authors = [{ name = "salpy contributors" }]
 keywords = ["SAL", "model-checking", "formal-methods"]
 classifiers = [
@@ -19,6 +19,32 @@ classifiers = [
   "Topic :: Software Development :: Testing",
 ]
 
-[tool.setuptools.packages.find]
-include = ["salpy*"]
+[dependency-groups]
+dev = ["mypy>=1.15", "pytest>=8.3", "pytest-cov>=6", "ruff>=0.11"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["salpy"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: requires a working SAL installation"]
+
+[tool.coverage.run]
+source = ["salpy"]
+branch = true
+
+[tool.mypy]
+python_version = "3.10"
+files = ["salpy"]
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
 

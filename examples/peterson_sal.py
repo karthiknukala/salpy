@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import bootstrap  # noqa: F401
+from common import sal_example, section, show_counterexample, show_lines, show_result, title
 
 from salpy import SAL
-
-from common import sal_example, section, show_counterexample, show_lines, show_result, title
 
 
 def main() -> None:
@@ -39,6 +38,12 @@ def main() -> None:
         show_result(ctl)
         if ctl.witness:
             print(f"witness object: {ctl.witness.class_name}")
+
+        section("Rebuild the Composition")
+        left = ctx.module("process", False)
+        right = ctx.module("process", True).rename(pc1="pc2", pc2="pc1", x1="x2", x2="x1")
+        rebuilt = left.async_(right)
+        show_result(rebuilt.check("G(NOT(pc1 = critical AND pc2 = critical))"))
 
         section("Simulation")
         sim = sal.simulate(system)

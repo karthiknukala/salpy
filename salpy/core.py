@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
 
 from .builders import ContextBuilder
+from .composition import ModuleExpression
 from .engines import Engines
-from .objects import Assertion, Context, Module, SalObject, Term, Type, wrap_object
+from .objects import Assertion, BddFsm, Context, Module, SalObject, Term, Type, wrap_object
 from .session import SalSession
 from .sexpr import scheme_call, scheme_literal
 from .simulation import Simulation
@@ -26,19 +26,23 @@ class SAL:
         executable: str | os.PathLike[str] | None = None,
         context_path: Iterable[str | os.PathLike[str]] | None = None,
         timeout: float = 30.0,
+        startup_timeout: float = 30.0,
+        env: dict[str, str] | None = None,
     ) -> None:
         self.session = SalSession(
             sal_dir,
             executable=executable,
             context_path=context_path,
             timeout=timeout,
+            startup_timeout=startup_timeout,
+            env=env,
         )
         self.engines = Engines(self)
 
     def close(self) -> None:
         self.session.close()
 
-    def __enter__(self) -> "SAL":
+    def __enter__(self) -> SAL:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -56,7 +60,9 @@ class SAL:
     def load_context(self, path_or_name: str | os.PathLike[str]) -> Context:
         """Load a context by file path or by SAL context name."""
 
-        value = Path(path_or_name) if isinstance(path_or_name, os.PathLike) else Path(str(path_or_name))
+        value = (
+            Path(path_or_name) if isinstance(path_or_name, os.PathLike) else Path(str(path_or_name))
+        )
         if value.exists():
             ref, class_name = self.session.define(
                 scheme_call("salpy/load-context-file!", str(value.resolve()))
@@ -88,11 +94,7 @@ class SAL:
             if not match:
                 raise ValueError("Could not infer the context name; pass name=...")
             name = match.group(1)
-        if directory is None:
-            directory = tempfile.mkdtemp(prefix="salpy-")
-        path = Path(directory) / f"{name}.sal"
-        path.write_text(source, encoding="utf-8")
-        return self.load_context(path)
+        return self.load_context(self.session.write_source(source, name, directory))
 
     def context(self, name: str) -> Context:
         ref, class_name = self.session.define(scheme_call("sal/context", name))
@@ -122,34 +124,41 @@ class SAL:
         ref, class_name = self.session.define(scheme_call("sal/assertion-name", text))
         return wrap_object(self.session, ref, class_name, kind="assertion")
 
-    def module(self, text: str) -> Module:
-        ref, class_name = self.session.define(scheme_call("sal/module", text))
+    def module(self, text: str | ModuleExpression) -> Module:
+        ref, class_name = self.session.define(scheme_call("sal/module", str(text)))
         return wrap_object(self.session, ref, class_name, kind="module")
 
     def state_expr(self, text: str, module: str | Module) -> Term:
         module_obj = self.module(module) if isinstance(module, str) else module
+        module_obj._sal_ref(session=self.session)
         return module_obj.state_expr(text)
 
     def flat_module(self, module: str | Module, *, skolemize: bool = False) -> Module:
         module_obj = self.module(module) if isinstance(module, str) else module
+        module_obj._sal_ref(session=self.session)
         return module_obj.flat(skolemize=skolemize)
 
     def boolean_module(self, module: str | Module, *, skolemize: bool = False) -> Module:
         module_obj = self.module(module) if isinstance(module, str) else module
+        module_obj._sal_ref(session=self.session)
         return module_obj.boolean(skolemize=skolemize)
 
-    def fsm(self, module: str | Module):
+    def fsm(self, module: str | Module) -> BddFsm:
         module_obj = self.module(module) if isinstance(module, str) else module
+        module_obj._sal_ref(session=self.session)
         return module_obj.fsm()
 
     def simplify(self, obj: SalObject) -> SalObject:
+        obj._sal_ref(session=self.session)
         return obj.call("sal/simplify")
 
     def cse(self, obj: SalObject) -> SalObject:
+        obj._sal_ref(session=self.session)
         return obj.call("sal/cse")
 
     def reset(self) -> None:
         self.session.eval("(begin (sal/reset!) #unspecified)")
+        self.session.generation += 1
 
     def configure(
         self,
@@ -181,12 +190,19 @@ class SAL:
         )
 
     def append_context_path(self, *paths: str | os.PathLike[str]) -> None:
-        items = "(list " + " ".join(scheme_literal(str(Path(path))) for path in paths) + ")"
-        self.session.eval(f"(begin (sal-env/append-to-sal-context-path! *sal-env* {items}) #unspecified)")
+        resolved = [str(Path(path).resolve()) for path in paths]
+        items = scheme_literal(resolved)
+        self.session.eval(
+            f"(begin (sal-env/append-to-sal-context-path! *sal-env* {items}) #unspecified)"
+        )
+        self.session.context_path.extend(resolved)
 
     def set_context_path(self, *paths: str | os.PathLike[str]) -> None:
-        items = "(list " + " ".join(scheme_literal(str(Path(path))) for path in paths) + ")"
+        resolved = [str(Path(path).resolve()) for path in paths]
+        items = scheme_literal(resolved)
         self.session.eval(f"(begin (sal-env/set-sal-context-path! *sal-env* {items}) #unspecified)")
+        self.session.context_path = resolved
+        self.session._env_overrides["SALCONTEXTPATH"] = ""
 
     def help(self, prefix: str = "") -> str:
         return self.session.capture_text(
@@ -206,7 +222,7 @@ class SAL:
     def builder(self, name: str, *, params: str | None = None) -> ContextBuilder:
         return ContextBuilder(name=name, params=params)
 
-    def simulate(self, module_or_fsm: str | Module | Any) -> Simulation:
+    def simulate(self, module_or_fsm: str | Module | BddFsm) -> Simulation:
         return Simulation(self, module_or_fsm)
 
 

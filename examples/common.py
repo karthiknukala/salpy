@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-from salpy import CheckResult, SAL
+from salpy import SAL, CheckResult
 
 
 def sal_example(sal: SAL, *parts: str) -> Path:
@@ -45,4 +45,3 @@ def show_counterexample(result: CheckResult, *, states: int = 3) -> None:
         print()
         print(f"state {idx}:")
         show_lines(state.splitlines(), limit=10)
-

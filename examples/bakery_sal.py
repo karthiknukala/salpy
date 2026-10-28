@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import bootstrap  # noqa: F401
-
-from salpy import SAL
-
 from common import sal_example, section, show_counterexample, show_result, title
 
+from salpy import SAL
 
 INSTANCE = "bakery{3,4}"
 
